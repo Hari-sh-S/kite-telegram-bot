@@ -1,4 +1,4 @@
-Flask
+Flask==2.3.2
 python-telegram-bot==20.7
-kiteconnect
-python-dotenv
+kiteconnect==3.11.0
+python-dotenv==1.0.0
