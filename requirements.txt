@@ -1,5 +1,4 @@
 Flask==2.3.2
 python-telegram-bot==20.7
-kiteconnect
+kiteconnect==3.9.4
 python-dotenv==1.0.0
-
