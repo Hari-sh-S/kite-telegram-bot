@@ -9,38 +9,27 @@ from kiteconnect import KiteConnect
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ----------------- CONFIG (from environment) -----------------
+# ---------------- CONFIG -----------------
 API_KEY = os.getenv("KITE_API_KEY")
 API_SECRET = os.getenv("KITE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-REDIRECT_URL = os.getenv("REDIRECT_URL")  # optional
-
+REDIRECT_URL = os.getenv("REDIRECT_URL", "http://127.0.0.1:5000/callback")
 TOKENS_FILE = "tokens.json"
 PORT = int(os.getenv("PORT", 5000))
 
 if not (API_KEY and API_SECRET and TELEGRAM_TOKEN):
-    print("⚠️ WARNING: some environment variables are missing!")
+    print("⚠️ Missing environment variables! Please set API_KEY, API_SECRET, TELEGRAM_TOKEN.")
 
-# ----------------- KITE CLIENT helper -----------------
-def kite_client_with_token(access_token: str):
-    kite = KiteConnect(api_key=API_KEY)
-    kite.set_access_token(access_token)
-    return kite
+kite = None
 
-# ----------------- Token storage helpers -----------------
-def _to_serializable(d: dict) -> dict:
-    out = {}
-    for k, v in d.items():
-        if isinstance(v, (datetime, )):
-            out[k] = v.isoformat()
-        else:
-            out[k] = v
-    out["saved_at"] = datetime.now().isoformat()
-    return out
-
+# ---------------- Token Helpers -----------------
 def save_tokens(tokens: dict):
+    data = tokens.copy()
+    if "expires_at" in data and isinstance(data["expires_at"], datetime):
+        data["expires_at"] = data["expires_at"].isoformat()
+    data["saved_at"] = datetime.now().isoformat()
     with open(TOKENS_FILE, "w") as f:
-        json.dump(_to_serializable(tokens), f)
+        json.dump(data, f)
 
 def load_tokens():
     if not os.path.exists(TOKENS_FILE):
@@ -54,22 +43,27 @@ def load_tokens():
             data["saved_at"] = datetime.now() - timedelta(days=1)
     return data
 
-# ----------------- Validate / refresh tokens -----------------
+# ---------------- Kite Client -----------------
+def kite_client_with_token(access_token: str):
+    k = KiteConnect(api_key=API_KEY)
+    k.set_access_token(access_token)
+    return k
+
 def is_access_token_valid(access_token: str) -> bool:
     try:
-        kite = kite_client_with_token(access_token)
-        kite.profile()
+        k = kite_client_with_token(access_token)
+        k.profile()
         return True
     except Exception:
         return False
 
 def ensure_tokens_valid() -> bool:
+    global kite
     saved = load_tokens()
     if not saved:
         return False
     access_token = saved.get("access_token")
     if access_token and is_access_token_valid(access_token):
-        global kite
         kite = kite_client_with_token(access_token)
         return True
     refresh_token = saved.get("refresh_token")
@@ -86,9 +80,7 @@ def ensure_tokens_valid() -> bool:
         print("Token refresh failed:", e)
         return False
 
-kite = None
-
-# ----------------- Flask callback for login -----------------
+# ---------------- Flask Callback -----------------
 app = Flask(__name__)
 
 @app.route("/callback")
@@ -100,26 +92,27 @@ def callback():
         kite_base = KiteConnect(api_key=API_KEY)
         session = kite_base.generate_session(req_token, api_secret=API_SECRET)
         save_tokens(session)
-        return "✅ Login success. You can return to Telegram and use /snapshot."
+        return "✅ Login success! You can return to Telegram and use /snapshot."
     except Exception as e:
         return f"❌ Error creating session: {e}", 500
 
-# ----------------- Telegram command handlers -----------------
+# ---------------- Telegram Commands -----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Hello! Use /login to authenticate Kite, then /snapshot to view portfolio.")
+    await update.message.reply_text(
+        "👋 Hello! Use /login to authenticate Kite, then /snapshot to view portfolio."
+    )
 
 async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kite_base = KiteConnect(api_key=API_KEY)
     login_url = kite_base.login_url()
-    if REDIRECT_URL:
-        login_url += f"&redirect_uri={REDIRECT_URL}"
-    await update.message.reply_text("🔐 Click to login to Kite:\n" + login_url)
+    login_url += f"&redirect_uri={REDIRECT_URL}"
+    await update.message.reply_text(f"🔐 Click to login to Kite:\n{login_url}")
 
-def _format_table_html(holdings):
+def format_portfolio_table(holdings):
     header = "📌 Portfolio Snapshot\n\n"
     rows = []
     rows.append(f"{'Symbol':<10} {'Qty':>5} {'Avg':>10} {'LTP':>10} {'P&L':>12}")
-    rows.append("-" * 52)
+    rows.append("-"*52)
     total_pnl = 0.0
     for h in holdings:
         sym = h.get("tradingsymbol", "N/A")
@@ -127,34 +120,32 @@ def _format_table_html(holdings):
         avg = h.get("average_price", 0.0) or 0.0
         ltp = h.get("last_price", 0.0) or 0.0
         try:
-            pnl = (float(ltp) - float(avg)) * float(qty)
+            pnl = (ltp - avg) * qty
         except Exception:
             pnl = 0.0
         total_pnl += pnl
         emoji = "🟢" if pnl >= 0 else "🔴"
         rows.append(f"{sym:<10} {qty:>5} {avg:>10.2f} {ltp:>10.2f} {emoji} {pnl:>9.2f}")
-    rows.append("-" * 52)
+    rows.append("-"*52)
     tot_emoji = "🟢" if total_pnl >= 0 else "🔴"
     rows.append(f"{'TOTAL':<10} {'':>5} {'':>10} {'':>10} {tot_emoji} {total_pnl:>9.2f}")
-    pre = "<pre>" + "\n".join(rows) + "</pre>"
-    return header + pre
+    return header + "<pre>" + "\n".join(rows) + "</pre>"
 
 async def snapshot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok = ensure_tokens_valid()
-    if not ok:
-        await update.message.reply_text("⚠️ Session missing / expired. Please use /login and complete the flow.")
+    if not ensure_tokens_valid():
+        await update.message.reply_text("⚠️ Session missing/expired. Please use /login and complete the flow.")
         return
     try:
         holdings = kite.holdings() or []
         if not holdings:
             await update.message.reply_text("📭 No holdings found.")
             return
-        html_msg = _format_table_html(holdings)
+        html_msg = format_portfolio_table(holdings)
         await update.message.reply_text(html_msg, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         await update.message.reply_text(f"❌ Error fetching portfolio: {e}")
 
-# ----------------- Run Flask + Telegram together -----------------
+# ---------------- Run Flask + Telegram -----------------
 def run_flask():
     app.run(host="0.0.0.0", port=PORT)
 
